@@ -1,0 +1,125 @@
+---
+title: "Example DeMixT"
+author: "Jenny Smith"
+date: "June 11, 2018"
+output: html_document
+---
+
+
+```{r setup, echo=FALSE, cache=FALSE}
+library(knitr)
+
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', 
+                      fig.width = 10, fig.height = 10, error = TRUE)
+
+knitr::opts_knit$set(root.dir = '/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/RNA/mRNAseq/analysis/2018.05.31_1031_BatchEffects')
+
+```
+
+
+
+```{r}
+cts <- read.csv("~/RNA_seq_Analysis/0000.00.03_Expression_Matrices/TARGET_AML_AAML1031_dupGenesRemoved_FractionalCounts.csv", 
+                stringsAsFactors = FALSE, row.names = 1)
+
+head(cts[,1:5])
+```
+
+
+#In-Sillico Purification Methods 
+
+```{r}
+install.packages("~/Downloads/DeMixT_0.2.1.tar.gz",
+                 repos = NULL,
+                 type="source")
+```
+
+
+```{r}
+library(DeMixT)
+```
+
+
+#Examine the test data
+
+```{r}
+data(test.data1) 
+```
+
+```{r}
+lapply(test.data1, head) #y is the tumors, and comp1 is the normals 
+lapply(test.data1, class) #need matrix classes
+lapply(test.data1, dim) #same number of rows == genes in each dataset
+```
+
+
+```{r}
+res <- DeMixT(data.Y = test.data1$y, 
+              data.comp1 = test.data1$comp1,
+              if.filter = FALSE) 
+```
+
+
+```{r}
+lapply(res, head)
+```
+
+
+#Try with Dummy Data
+
+
+```{r}
+set.seed(1)
+y.temp <- sapply(5:19, function(x) rnorm(50,mean=x))
+comp1.temp <- sapply(3:17, function(x) rnorm(50,mean=x))
+# class(y.temp) #matrix
+# class(comp1.temp) #matrix
+
+data.temp <- list("y"=y.temp, 
+                  "comp1"=comp1.temp)
+str(data.temp)
+```
+
+```{r}
+dummydat <- DeMixT(data.Y = data.temp$y, 
+                   data.comp1 = data.temp$comp1, 
+                    if.filter = FALSE)
+```
+
+
+
+#Try with my Data 
+
+```{r}
+
+#Use first 100 rows and first few samples for testing.
+data.AML <- list("y"=as.matrix(cts[1:100,grep("^P", colnames(cts))[1:10]]), 
+                 "comp1"=as.matrix(cts[1:100,grep("^BM|RO", colnames(cts))[1:5]]))
+
+#Tried to remove rownames/colnames to make it more similar to the example data. did not help. 
+attr(data.AML$y,"dimnames") <- NULL
+attr(data.AML$comp1, "dimnames") <- NULL
+
+str(data.AML)
+```
+
+```{r}
+lapply(data.AML, function(x) head(x[,1:5]))
+lapply(data.AML, class)
+lapply(data.AML, dim)
+```
+
+```{r}
+deconv.AML <- DeMixT(data.Y = data.AML$y,
+                     data.comp1 = data.AML$comp1,
+                     if.filter = FALSE)
+```
+
+
+
+#Session Info
+
+```{r}
+sessionInfo()
+```
+

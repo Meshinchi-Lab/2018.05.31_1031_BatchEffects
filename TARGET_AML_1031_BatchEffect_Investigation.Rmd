@@ -1,0 +1,1320 @@
+---
+title: 'RNAseq Batch Effects Investigation'
+author: "Jenny Smith"
+date: "June 1, 2018"
+output: html_document
+---
+
+#Set-up
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', fig.width = 10, fig.height = 10)
+knitr::opts_knit$set(root.dir = '/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/RNA/mRNAseq/analysis/2018.05.31_1031_BatchEffects')
+options(stringsAsFactors = FALSE)
+```
+
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(edgeR)
+library(genefilter)
+getwd()
+```
+
+
+
+```{r}
+source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/clusterAnalysis_Function.r")
+source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/ggplot_Themes_Function.r")
+source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/rmDupGenes_Function.r")
+```
+
+
+
+#Read in the Clinical Data
+
+```{r}
+merged <- read.csv("~/reference_mapping-files/TARGET_AML_0531_1031_merged_CDEs_1.10.19.csv") %>% 
+  mutate(CBFA2T3.GLIS2=gsub("Intermediate", "Yes", CBFA2T3.GLIS2))
+
+head(merged[,1:5])
+dim(merged)
+
+table(merged$CBFA2T3.GLIS2)
+```
+
+
+```{r}
+CDE.1031 <- read.csv("~/reference_mapping-files/TARGET_AML_1031_CDE_cleaned_6.28.18.csv", 
+                     stringsAsFactors = FALSE)
+
+head(CDE.1031[,1:5])
+# dim(CDE.1031) #1269   61
+```
+
+```{r}
+blasts <- read.csv("~/reference_mapping-files/AAML1031_RNA_seq_with_blasts.csv", 
+                   stringsAsFactors = FALSE) %>%
+  mutate(Sample.ID=gsub("-", "\\.", str_split_fixed(Sample.ID, "-", n=3)[,3]))
+
+# head(blasts)
+table(blasts$Rough.Molecular.Classification)
+```
+
+flow.blasts <- read.csv("~/reference_mapping-files/AML1031 %blasts at DX_from_Hematologics.csv", 
+                        stringsAsFactors = FALSE, na.strings = c("na","#N/A","NA","n/a","NA.+", ""))
+
+
+flow.blasts_clean <- flow.blasts %>%
+  filter(grepl("^[0-9]", Patient.registration.number.1)) %>%
+  mutate(Blast.Perc_byFlow=ifelse(grepl("^[0-9]", X..Tumor), X..Tumor, NA)) %>%
+  mutate(Blast.Perc_byFlow=as.numeric(as.character(gsub("\\%", "", Blast.Perc_byFlow))))
+
+head(flow.blasts_clean)
+
+```{r}
+CDE.0531 <- read.csv("~/reference_mapping-files/TARGET_AML_current_asof_june30_2016_UPDATED_CLEAN_4.19.18.csv", 
+                   stringsAsFactors = FALSE)
+
+head(CDE.0531[,1:5])
+```
+
+
+#Additional Annotations
+
+```{r}
+MutationAnno <- read.csv("~/reference_mapping-files/GSC_1483_sample_identity_for_PCA_clustering.csv", 
+                         stringsAsFactors = FALSE)
+
+head(MutationAnno)
+# dim(MutationAnno)
+```
+
+```{r}
+table(MutationAnno$Batch)
+```
+
+```{r}
+platesA <- read.csv("~/reference_mapping-files/AAML1031_Reg_USI_conversion_for_miRNAseq_batchInfo.csv", 
+                    stringsAsFactors = FALSE)
+# dim(platesA) #1186    4
+head(platesA)
+```
+
+
+```{r}
+platesB <- read.csv("~/reference_mapping-files/TARGET_AML_1031_Ribodepleted_RNA_Seq_Rare_Variant_list_with_Quality_Annotated.csv", 
+                    stringsAsFactors = FALSE)
+
+platesB$USI <- str_split_fixed(platesB$External_ID, "-", n=4)[,3]
+
+head(platesB)
+# dim(platesB) #460  77
+```
+
+
+#Read in the expression data
+
+```{r}
+TPMs <- read.csv("~/RNA_seq_Analysis/0000.00.03_Expression_Matrices/TARGET_AML_AAML1031_withStella_dupGenesRemoved_TPM.csv",
+                 row.names = 1)
+
+colnames(TPMs) <- str_split_fixed(colnames(TPMs), "\\.", 2)[,1]
+
+# head(TPMs[,1:5])
+# dim(TPMs) #51573  1115
+```
+
+
+```{r}
+TPMs <- TPMs %>%
+  select(-(matches("^Kas|^MV")))
+
+dim(TPMs)
+```
+
+
+```{r}
+#Filter for TPMs >= 50 counts. 
+TPMs.Filt.Stingent <- filterGs(expnMatrix = TPMs, cutoff = 49, log2 = FALSE)
+# head(TPMs.Filt.Stingent[,1:5])
+# dim(TPMs.Filt.Stingent) #29,298 genes
+```
+
+```{r}
+#Only removing zeros
+TPMs.Filt.rm0 <- filterGs(expnMatrix = TPMs, cutoff = 1, log2 = FALSE)
+# head(TPMs.Filt.rm0[,1:5])
+# dim(TPMs.Filt.rm0) #46,312 genes
+```
+
+
+```{r}
+cts <- read.csv("~/RNA_seq_Analysis/0000.00.03_Expression_Matrices/TARGET_AML_AAML1031_dupGenesRemoved_FractionalCounts.csv", 
+                stringsAsFactors = FALSE, row.names = 1)
+
+colnames(cts) <- str_split_fixed(colnames(cts), "\\.", 2)[,1]
+head(cts[,1:5])
+# dim(cts)
+```
+
+
+
+#Define Annotation Dataframe for Clustering
+
+```{r}
+add <- setdiff(colnames(cts), blasts$USI) #73 
+  # str_split_fixed(., "\\.", 3) %>%
+  # .[,1]
+
+Sample.ID <- setdiff(colnames(cts), blasts$Sample.ID)
+```
+
+
+```{r}
+Addl <- CDE.0531 %>%
+  filter(TARGET.USI.1 %in% add) %>%
+  mutate(
+    Rough.Molecular.Classification = case_when(
+      Known.Fusion.detected.by.any.method == "CBFA2T3-GLIS2" ~ "CBFA2T3-GLIS2",
+      Known.Fusion.detected.by.any.method == "NUP98-NSD1" ~ "NUP98",
+      MLL == "Yes" ~ "KMT2A",
+      Primary.Cytogenetic.Code == "Normal" ~ "CN",
+      Primary.Cytogenetic.Code == "Other" ~ "Other",
+      TRUE ~ "Other")) %>%
+  rowwise() %>%
+  mutate(Sample.ID=grep(TARGET.USI.1,Sample.ID, value = TRUE))  %>%
+  select(USI=TARGET.USI.1, Patient.ID=Reg., Sample.ID,
+         Blast..=Bone.marrow.leukemic.blast.percentage...., Peripheral.blasts....,
+         Rough.Molecular.Classification) %>%
+  mutate(Blast..=ifelse(grepl("03A", Sample.ID), Peripheral.blasts...., Blast..)) %>%
+  select(-Peripheral.blasts....)
+
+table(Addl$Rough.Molecular.Classification)
+```
+
+
+```{r}
+blasts.anno <- blasts %>%
+  bind_rows(Addl,.) %>% 
+  bind_rows(., data.frame(USI=setdiff(add,Addl$USI), 
+                          Patient.ID=rep(NA,65),
+                          Sample.ID=rep(NA, 65),
+                          # Sample.ID=setdiff(Sample.ID,Addl$Sample.ID), 
+                          Rough.Molecular.Classification=rep(NA,65), 
+                          Blast..=rep(NA,65), 
+                          stringsAsFactors = FALSE)) %>%
+  mutate(Rough.Molecular.Classification=ifelse(is.na(Rough.Molecular.Classification),
+                                               "None", Rough.Molecular.Classification)) %>%
+  left_join(., select(platesA, USI,Seq.Plate), by="USI") %>%
+  left_join(., select(CDE.1031, USI, Blast.Perc_byFlow), by="USI") %>%
+  mutate(Group=ifelse(grepl("^BM|^RO",  USI), "NBM","AML")) %>%
+  mutate(Seq.Plate=gsub(" " ,"", ifelse(is.na(Seq.Plate), "Unknown", Seq.Plate))) %>%
+  mutate(Rough.Molecular.Classification=gsub("-","\\.",Rough.Molecular.Classification)) %>%
+  mutate(Blast.Frac_byFlow=Blast.Perc_byFlow/100)
+
+  
+#Add the others soon 
+  # left_join(.,select(platesB,USI,Seq.Plate=Plate.), by="USI") %>%
+  # mutate_at(vars(contains("Seq.Plate")), funs(ifelse(is.na(.), "", .))) %>%
+  # unite(Seq.Plate,Seq.Plate.x, Seq.Plate.y, sep = "")
+  
+  
+# dim(blasts.anno) #1111    by 8
+head(blasts.anno)
+```
+
+
+```{r}
+quantile(blasts.anno$Blast..,na.rm=TRUE)
+# quantile(blasts.anno$Blast.Frac_byFlow, na.rm=TRUE)
+quantile(blasts.anno$Blast.Perc_byFlow, na.rm=TRUE)
+```
+
+
+
+#Plot Blast % reported at DX to Blast % by Flow Cytometry
+
+```{r}
+colors <- c("turquoise3", "blue", "green4", "black",
+            "seagreen2", "maroon","Yellow",  "saddlebrown",
+                "darkblue", "azure4", "chartreuse1","orange1", 
+                "deeppink", "darkslategray1", "navajowhite2",
+                "brown3",
+            "deepskyblue1", "cornflowerblue","mediumorchid","darkmagenta")
+```
+
+```{r}
+cc <-  colors[1:16] 
+names(cc) <- unique(blasts.anno$Rough.Molecular.Classification) %>% .[order(.)]
+cc["None"] <- "darkgrey"
+cc
+```
+
+```{r fig.height=5}
+
+blast_CDE_vs_Blast_Flow <- ggplot(data=blasts.anno, 
+       aes(x=Blast.., y=Blast.Perc_byFlow)) + 
+  geom_point(aes(color = blasts.anno$Rough.Molecular.Classification)) +
+  theme_numX +
+  geom_smooth(method="lm", se=TRUE, color="black") + 
+  labs(x="Blast Percentage") + 
+  scale_color_manual(values=cc) 
+
+blast_CDE_vs_Blast_Flow
+# ggsave(blast_CDE_vs_Blast_Flow, filename = "TARGET_AML_1031_blast_CDE_vs_Blast_Flow_ScatterPlot.tiff", device = "tiff", dpi=600, units="in", height=5, width=10 )
+```
+
+
+```{r}
+b.complete <- blasts.anno[complete.cases(blasts.anno),]
+cor(b.complete$Blast.., b.complete$Blast.Perc_byFlow, method="spearman") #0.61 
+```
+
+```{r}
+table(blasts.anno$Rough.Molecular.Classification, useNA="always")
+table(blasts.anno$Seq.Plate,useNA="always")
+```
+
+
+```{r}
+bins <- cut(blasts.anno$Blast..,breaks = 10) #would not work within mutate() for some reason?
+
+blasts.anno <- blasts.anno %>%
+  bind_cols(.,as.data.frame(bins))%>%
+  mutate(bins=ifelse(is.na(bins), "Unknown", as.character(bins))) %>%
+  mutate(bins=gsub("\\(|\\]", "",bins))%>%
+  mutate(bins=gsub("\\-0\\.1","0",bins)) %>% 
+  mutate(bins=gsub(",", ".", bins))
+
+table(blasts.anno$bins)
+```
+
+
+
+#Complete PCA with the Blast % information 
+
+
+```{r}
+pheno <- blasts.anno$Blast.. %>% 
+  set_names(blasts.anno$USI)
+
+head(pheno)
+```
+
+```{r message=FALSE}
+PCA.Clust <- PCA(expnData = cts, 
+           phenovector = pheno)
+```
+
+```{r}
+# PCA.Clust$pca_plot
+```
+
+```{r}
+PCA.Clust$pca_data <- PCA.Clust$pca_data %>% 
+  inner_join(., blasts.anno, by=c("name"="Sample.ID")) %>%
+  mutate(Blast.Groups = case_when(
+    is.na(Blast..) ~ "None or Unknown",
+    Blast.. == 0 ~ "0%",
+    Blast.. <= 25 ~ "<25%",
+    Blast.. > 25 & Blast.. <= 50 ~ "between 25% - 50%",
+    Blast.. > 50 & Blast.. <= 75 ~ "between 50% - 75%",
+    Blast.. > 75 ~ ">75%")) %>% 
+  mutate(Blast.Groups=factor(Blast.Groups, levels=c("None or Unknown", "0%","<25%","between 25% - 50%", "between 50% - 75%", ">75%")))
+
+PCA.Clust$pca_data
+```
+
+
+```{r fig.height=10, fig.width=15}
+ggplot(data = PCA.Clust$pca_data, aes(x=PC1, y=PC2)) +
+  geom_point(size=5,
+             aes(color=Blast..,
+             shape=Group)) + 
+  scale_shape_manual(values = c("AML"=16,"NBM"=15)) + 
+  scale_color_gradient(low = "lightblue", high = "darkblue", na.value = "darkgrey") +
+  # stat_ellipse(aes(x=PC1, y=PC2,group=Group), type="norm") +
+  theme_numX
+```
+
+
+```{r fig.height=10, fig.width=15}
+# tiff("TARGET_AML_1031_AllSamples_PCA_discreteBlastPerc.tiff", height = 10, width = 15, units = "in", res=600)
+
+blast.colors <- c("None or Unknown"="darkgrey", 
+                                "0%"="cadetblue2",
+                                "<25%"="cadetblue",
+                                "between 25% - 50%"="firebrick1", 
+                                "between 50% - 75%"= "firebrick3", 
+                                ">75%"="firebrick4")
+
+ggplot(data = PCA.Clust$pca_data, aes(x=PC1, y=PC2)) +
+  geom_point(size=4,
+             aes(color=Blast.Groups,
+             shape=Group)) + 
+  scale_shape_manual(values = c("AML"=16,"NBM"=15)) + 
+  scale_color_manual(values = blast.colors)+
+  stat_ellipse(aes(x=PC1, y=PC2,group=Group), type="t") +
+  theme_numX
+# dev.off()
+```
+
+
+```{r}
+ggplot(data = PCA.Clust$pca_data, aes(x=PC1, y=PC2)) +
+  geom_point(size=4,
+             aes(color=Seq.Plate,
+             shape=Group)) + 
+  scale_shape_manual(values = c("AML"=16,"NBM"=15)) + 
+  # scale_color_manual(values = blalimmst.colors)+
+  stat_ellipse(aes(x=PC1, y=PC2,group=Group), type="t") +
+  theme_numX
+```
+
+```{r}
+colors <- c("turquoise3", "blue", "green4", "black",
+            "seagreen2", "maroon","Yellow",  "saddlebrown",
+                "darkblue", "azure4", "chartreuse1","orange1", 
+                "deeppink", "darkslategray1", "navajowhite2",
+                "brown3",
+            "deepskyblue1", "cornflowerblue","mediumorchid","darkmagenta")
+```
+
+```{r}
+cc <-  colors[1:16] 
+names(cc) <- unique(PCA.Clust$pca_data$Rough.Molecular.Classification) %>% .[order(.)]
+cc["None"] <- "darkgrey"
+cc
+```
+
+
+```{r fig.height=10, fig.width=15}
+# tiff("TARGET_AML_1031_AllSamples_PCA_ByCytoGroup.tiff", height = 10, width = 15, units = "in", res=600)
+ggplot(data = PCA.Clust$pca_data, aes(x=PC1, y=PC2)) +
+  geom_point(size=4,stroke=2,
+             aes(shape=Group,
+                 color=Rough.Molecular.Classification)) + 
+  scale_shape_manual(values = c("AML"=16,"NBM"=15)) + 
+  scale_color_manual(values = cc) + 
+  theme_numX
+# dev.off()
+```
+
+
+```{r fig.height=15, fig.width=15}
+# tiff("TARGET_AML_1031_AllSamples_PCA_Group_BlastPerc.tiff", height = 10, width = 15, units = "in", res=600)
+ggplot(data = PCA.Clust$pca_data, aes(x=PC1, y=PC2)) +
+  geom_point(size=5,stroke=2,
+             aes(fill=Blast.., 
+                 shape=Group,
+                 color=Rough.Molecular.Classification)) + 
+  scale_shape_manual(values = c("AML"=21,"NBM"=22)) + 
+  scale_fill_gradient(low = "white", high = "black", na.value = "darkgrey") +
+  scale_color_manual(values = cc) + 
+  stat_ellipse(data=subset(PCA.Clust$pca_data, 
+                           grepl("KMT2A|RUNX1-RUNX1T1|CBFB-MYH11", PCA.Clust$pca_data$Rough.Molecular.Classification)), 
+               mapping = aes(x=PC1,y=PC2, group=Rough.Molecular.Classification), type="t") +
+  theme_numX
+# dev.off()
+```
+
+
+NOTE: Need to examine the loadings of the PCA!! Which genes contribute to the differences based on blast %, esp. on PC1 as it appears within cyto groups, PC1 accounts for the differences most. See Runx1-runx1t1 as a clear example. 
+
+
+
+#In-Sillico Purification Methods 
+
+
+
+##DeMixT
+
+```{r}
+# install.packages("~/Downloads/DeMixT_0.2.1.tar.gz",
+#                  lib="~/R/x86_64-pc-linux-gnu-library/3.4/",
+#                  repos = NULL,
+#                  type="source")
+```
+
+```{r}
+library(DeMixT)
+```
+
+Questions: 
+- Should this be normalized counts? Yes
+- Should you remove the low read counts? Yes
+
+## test data to check on installation 
+
+```{r}
+data(test.data1) 
+lapply(test.data1, head) #y is the tumors, and comp1 is the normals ]
+lapply(test.data1, dim) #same number of rows == genes
+lapply(test.data1, class) #need matrix classes
+
+str(test.data1)
+```
+
+```{r}
+res <- DeMixT(data.Y = test.data1$y, 
+              data.comp1 = test.data1$comp1,
+              if.filter = FALSE) 
+```
+
+```{r}
+#Unknown component == y == tumors
+lapply(res,head) #Proportions of the unknown component can be calculated by 1-colSums(res$pi)
+```
+
+```{r}
+# dim(res$decovExprT) #116 by 10
+```
+
+
+
+## Raw Counts 
+
+```{r}
+idx <- rowSums(cts) >= 10
+cts.filt <- cts[idx,]
+```
+
+```{r}
+#Use first 100 rows and first few samples for testing.
+data.test <- list("y"=as.matrix(cts.filt[,grep("^P", colnames(cts.filt))]), 
+                 "comp1"=as.matrix(cts.filt[,grep("^BM|RO", colnames(cts.filt))]))
+
+str(data.test)
+```
+
+Starting iteration for counts at 
+
+```{r}
+#Ran the full dataset on the raw counts directly on gizmos. Exact code used here. 
+#It worked with the full dataset! It took like 4 days though.... 
+res.test <- DeMixT(data.Y = data.test$y, 
+              data.comp1 = data.test$comp1,
+              if.filter = FALSE) 
+
+load("TARGET_AML_1031_rawCounts_DeMixT.RData")
+```
+
+
+```{r}
+# length(res.test$pi) #1049
+purities.pred <- data.frame(USI=colnames(res.test$pi), 
+                            purities=1-colSums(res.test$pi), 
+                            stringsAsFactors = FALSE) %>%
+  left_join(., blasts.anno, by="USI") %>%
+  select(USI, purities, Blast.., Blast.Perc_byFlow,Blast.Frac_byFlow, everything())
+
+head(purities.pred)
+```
+
+
+```{r}
+complete.Info <- purities.pred %>%
+  select(USI, purities, Blast.., Blast.Perc_byFlow,Blast.Frac_byFlow, Rough.Molecular.Classification) %>%
+  filter(complete.cases(.)) #1,001 patients with complete information. 
+
+round(cor(complete.Info$purities, complete.Info$Blast..), digits = 3) #0.3
+round(cor(complete.Info$purities, complete.Info$Blast.Perc_byFlow), digits=3) #0.313
+```
+
+
+```{r fig.height=5}
+# tiff("TARGET_AML_1031_rawCounts_DeMixT_scatterPlot.tiff", units="in", res=600, height=5, width=10)
+ggplot(complete.Info, aes(y=Blast.Frac_byFlow, x=purities)) + 
+  geom_point(aes(color=Rough.Molecular.Classification)) + 
+  theme_numX +
+  lims(x=c(0,1.0)) +
+  geom_abline(slope = 1, intercept = 0) +
+  geom_smooth(method="lm", color="black") + 
+  scale_color_manual(values=cc)
+# dev.off()
+```
+
+
+```{r}
+quantile(1-colSums(res.test$pi)) #really overestimates the purities 
+```
+
+
+##Median Ratio Normalized Counts
+
+```{r}
+#Read in the median ratio normalized counts. 
+norm.cts <-  read.csv("TARGET_AML_1031_DESeq2_MedianNormalized_Counts.csv", row.names = 1)
+# head(norm.cts[,1:5])
+dim(norm.cts)
+
+data.norm.cts <- list("y"=as.matrix(norm.cts[,grep("^P", colnames(norm.cts))]), 
+                  "comp1"=as.matrix(norm.cts[,grep("^BM|RO", colnames(norm.cts))]))
+
+str(data.norm.cts)
+rm(norm.cts)
+```
+
+
+```{r}
+
+#Run DeMixT
+res.norm.cts <- DeMixT(data.Y = data.norm.cts$y, 
+                   data.comp1 = data.norm.cts$comp1,
+                   if.filter = FALSE) 
+
+
+# save(res.norm.cts, file = "TARGET_AML_1031_DESeq2_Normalized_Counts_DeMixT.RData")
+res.norm.cts <- get(load("TARGET_AML_1031_DESeq2_Normalized_Counts_DeMixT.RData"))
+```
+
+```{r}
+dim(res.norm.cts$decovExprT)
+head(res.norm.cts$decovExprT[,1:5])
+```
+
+```{r}
+dim(res.norm.cts$decovExprN1)
+```
+
+
+```{r}
+# length(res.test$pi) #1049
+purities.pred.norm <- data.frame(USI=colnames(res.norm.cts$pi), 
+                            purities=1-colSums(res.norm.cts$pi), 
+                            stringsAsFactors = FALSE) %>%
+  left_join(., blasts.anno, by="USI") %>%
+  select(USI, purities, Blast.., Blast.Perc_byFlow,Blast.Frac_byFlow, everything()) %>%
+  arrange(purities)
+
+head(purities.pred.norm)
+```
+
+
+```{r}
+complete.Info.norm <- purities.pred.norm %>%
+  select(USI, purities, Blast.., Blast.Perc_byFlow,Blast.Frac_byFlow,Rough.Molecular.Classification) %>%
+  filter(complete.cases(.)) #1,001 patients with complete information. 
+
+round(cor(complete.Info.norm$purities, complete.Info.norm$Blast.., method = "spearman"), digits = 3) #0.41
+round(cor(complete.Info.norm$purities, complete.Info.norm$Blast.Perc_byFlow, method = "spearman"), digits=3) #0.46
+```
+
+
+```{r fig.height=5, fig.width=8}
+# library(RColorBrewer)
+# tiff("TARGET_AML_1031_DESeq2_NormCounts_DeMixT__scatterPlot.tiff", units="in", res=600, height=5, width=10)
+ggplot(complete.Info.norm, aes(y=Blast.Frac_byFlow, x=purities)) + 
+  geom_point(aes(color=Rough.Molecular.Classification)) + 
+  theme_numX +
+  lims(x=c(0,1.0), y=c(0,1.0)) +
+  geom_abline(slope = 1, intercept = 0) +
+  # geom_smooth(method="lm", color="black") + 
+  scale_color_manual(values=cc) + 
+  theme(legend.background=element_blank(),
+        legend.key=element_blank())
+# dev.off()
+
+```
+
+```{r}
+quantile(1-colSums(res.norm.cts$pi)) #really overestimates the purities 
+```
+
+
+
+## DeMixT with Norm Counts and Filtering for DEGs
+
+```{r}
+
+#Run DeMixT
+res.norm.filt <- DeMixT(data.Y = data.norm.cts$y, 
+                       data.comp1 = data.norm.cts$comp1,
+                       if.filter = TRUE, 
+                       output.more.info = TRUE) 
+
+
+save(res.norm.filt, file = "TARGET_AML_1031_DESeq2__Normalized_Counts_Filter_DeMixT.RData")
+
+```
+
+
+```{r}
+# res.norm.filt <- get(load("TARGET_AML_1031_DESeq2__Normalized_Counts_Filter_DeMixT.RData"))
+```
+
+```{r}
+head(data.norm.cts$y[,1:5])
+dim(data.norm.cts$y[,1:5]) # 46823     5
+```
+
+```{r}
+dim(res.norm.filt$decovExprT)
+head(res.norm.filt$decovExprT[,1:5])
+```
+
+```{r}
+dim(res.norm.filt$decovExprN1)
+head(res.norm.filt$decovExprN1[,1:5])
+```
+
+
+```{r}
+purities.pred.filt <- data.frame(USI=colnames(res.norm.filt$pi), 
+                            purities=1-colSums(res.norm.filt$pi), 
+                            stringsAsFactors = FALSE) %>%
+  left_join(., blasts.anno, by="USI") %>%
+  select(USI, purities, Blast.., Blast.Perc_byFlow,Blast.Frac_byFlow, everything()) %>%
+  arrange(purities)
+
+head(purities.pred.filt)
+```
+
+
+```{r}
+complete.Info.filt <- purities.pred.filt %>%
+  select(USI, purities, Blast.., Blast.Perc_byFlow,Blast.Frac_byFlow,Rough.Molecular.Classification) %>%
+  filter(complete.cases(.)) #1,001 patients with complete information. 
+
+round(cor(complete.Info.filt$purities, complete.Info.filt$Blast.., method = "spearman"), digits = 3) #0.41
+round(cor(complete.Info.filt$purities, complete.Info.filt$Blast.Frac_byFlow, method = "spearman"), digits=3) #0.46
+```
+
+```{r fig.height=5}
+ggplot(complete.Info.filt, aes(y=Blast.Frac_byFlow, x=purities)) + 
+  geom_point(aes(color=Rough.Molecular.Classification)) + 
+  theme_numX +
+  lims(x=c(0,1.0), y=c(0,1.0)) +
+  geom_abline(slope = 1, intercept = 0) +
+  # geom_smooth(method="lm", color="black") + 
+  scale_color_manual(values=cc) + 
+  theme(legend.background=element_blank(),
+        legend.key=element_blank())
+```
+
+
+
+## PCA with Deconvoluted Counts
+
+```{r}
+pca_custom <- function(expnData,CDE,fill.cat,color.cat){
+  #expnData has genes are rownames, patients as columns
+  #CDE has patients are rownames
+  #fill.cat is a character vector, length 1, with the column name from CDE to use for fill
+  #color.cat is a character vector, length 1, with the column name from CDE to use for fill
+
+  expnData <- expnData[,intersect(rownames(CDE),colnames(expnData))]
+
+  # print(dim(expnData))
+  pca <- prcomp(t(expnData), scale=TRUE)
+  summ <- summary(pca)
+
+  scores <- as.data.frame(pca$x) %>%
+    rownames_to_column("USI") %>%
+    inner_join(., select(CDE,USI=contains("USI"), everything()), by="USI") %>%
+    select(USI, everything())
+
+  pca.plot <- ggplot(scores, aes(x=PC1, y=PC2)) +
+    geom_point(size=3, stroke=2, alpha=0.85,shape=21,
+               aes_string(fill=fill.cat, color=color.cat)) +
+    # scale_color_manual(values=c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00","#A65628")) +
+    labs(x=paste("PC1: ", round(summ$importance[2,1], digits=3)*100, "% variance explained"),
+         y=paste("PC2: ", round(summ$importance[2,2], digits=3)*100, "% variance explained")) +
+    theme_numX  +
+    theme(legend.text = element_text(size=14),
+          legend.title = element_text(size=16))
+
+  res <- list(pca=pca,scores=scores,plot=pca.plot)
+  return(res)
+}
+```
+
+```{r}
+anno.demixt <- filter(blasts.anno, Group=="AML") %>%
+  as.data.frame() %>%
+  set_rownames(.$USI)
+anno.demixt
+```
+
+
+```{r}
+PCA.Clust.Deconv <- pca_custom(expnData = log2(res.norm.filt$decovExprT+1), 
+                               CDE =  anno.demixt, 
+                               fill.cat = "Blast..", 
+                               color.cat = "Rough.Molecular.Classification")
+```
+
+```{r}
+colors <- c("turquoise3", "blue", "green4", "black",
+            "seagreen2", "maroon","Yellow",  "saddlebrown",
+                "darkblue", "azure4", "chartreuse1","orange1", 
+                "deeppink", "darkslategray1", "navajowhite2",
+                "brown3",
+            "deepskyblue1", "cornflowerblue","mediumorchid","darkmagenta")
+```
+
+```{r}
+cc <-  colors[1:16] 
+names(cc) <- unique(PCA.Clust$pca_data$Rough.Molecular.Classification) %>% .[order(.)]
+cc["None"] <- "darkgrey"
+cc
+```
+
+
+```{r fig.width=14}
+PCA.Clust.Deconv$plot + 
+  scale_color_manual(values = cc) +
+  scale_fill_gradient(low="grey", high="black")
+```
+
+
+
+
+##Unmix from DESeq2 
+
+
+```{r}
+# install.packages("~/Downloads/DESeq2_1.20.0.tar.gz",
+#                  repos = NULL,
+#                  type="source")
+```
+
+
+```{r message=FALSE}
+library(DESeq2, lib.loc = "/home/jlsmith3/R/x86_64-pc-linux-gnu-library/3.4" )
+```
+
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = round(cts, digits = 0), 
+                              colData = blasts.anno, 
+                              design = ~Group) #levels based on Group are alphabetical, so OK. AML is first.
+
+dds <- dds[rowSums(counts(dds)) > 10, ]
+dim(dds) #46,823 by 1,111 
+```
+
+To find out why this optimization function is failing, Michael Love noted that highly correlated samples would cause an error, since any combination of the nearly idential pures would be equally good at explaining the trend/data. 
+
+https://support.bioconductor.org/p/110025/#110028
+
+```{r}
+vsd.blind <- vst(dds, blind = TRUE, fitType = "parametric")
+
+# head(assay(vsd.blind)[,1:30])
+```
+
+```{r}
+cor.vsd.nbm <- cor(assay(vsd.blind)[,grep("^RO|^BM", colnames(assay(vsd.blind)))])
+cor.vsd.aml <- cor(assay(vsd.blind)[,grep("^P", colnames(assay(vsd.blind)))])
+
+# head(vsd.b.nbm)
+```
+
+```{r fig.width=5, fig.height=5}
+hist(assay(vsd.blind))
+```
+
+```{r fig.height=10, fig.width=10}
+corrplot::corrplot(cor.vsd.nbm, method = "shade", type = "lower", diag = TRUE, order="FPC", tl.cex = 0.65, tl.col="black")
+# corrplot::corrplot(cor.vsd.aml, method = "shade", type = "lower", diag = TRUE, order="FPC")
+#RO02361,BM5682
+```
+
+```{r}
+range(cor.vsd.nbm)  #min is 0.95! 
+range(cor.vsd.aml) #min is 0.73 
+```
+
+```{r}
+t <- as.data.frame(cor.vsd.nbm) %>%
+  rownames_to_column("Sample") %>% 
+  filter_all(any_vars(. < 0.9571505))
+t
+```
+
+
+```{r}
+#Median of Ratios Methods normalization. 
+# dds <- PCA.Clust$dds
+dds <- estimateSizeFactors(dds)
+# dds <- estimateDispersions(dds, fitType="parametric") #asymptDisp: 0.5999724
+
+dispersionFunction(dds)
+```
+
+```{r}
+head(sizeFactors(dds))
+range(sizeFactors(dds))
+# str(dds)
+# mcols(dds)
+```
+
+
+```{r}
+norm.cts.dds <- counts(dds, normalized=TRUE)
+dim(norm.cts.dds)
+
+head(norm.cts.dds[,1:5])
+# write.csv(norm.cts.dds, "TARGET_AML_1031_DESeq2_MedianNormalized_Counts.csv", row.names = TRUE)
+
+
+```
+
+
+```{r}
+#Can use normalized counts
+aml.dds <- norm.cts.dds[,grep("^PA", colnames(norm.cts.dds))]
+
+# grep("^RO|^BM", colnames(norm.cts.dds),value=TRUE)
+# nbm.dds <- norm.cts.dds[,c("RO02361","BM5682")]
+nbm.dds <- norm.cts.dds[,c("RO02361")]
+
+# str(aml.dds)
+# class(aml.dds)
+dim(nbm.dds)
+head(nbm.dds)
+```
+
+ Using the 2 least correlated samples of NBM, I get to 24% finished before the algorithm stalls. 
+ 
+ But my question is, if there are cell lines used, how could they not be super highly correlated???
+ how does this function even work ever? 
+ 
+```{r}
+unmix.dds <- unmix(x=aml.dds, pure = as.matrix(nbm.dds), alpha=0.5999724)
+```
+
+
+```{r}
+msd <- vsn::meanSdPlot(as.matrix(TPMs))
+
+# msd$sd
+# msd$rank
+```
+
+
+```{r}
+#Or can use TPMs
+aml.TPM <- as.matrix(TPMs[,grep("^PA", colnames(TPMs))])
+nbm.TPM <- as.matrix(TPMs[,grep("^BM|^RO", colnames(TPMs))])
+```
+
+```{r}
+# unmix.TPM <- unmix(x=aml.TPM, pure = nbm.TPM, shift = )
+```
+
+
+
+
+
+
+##UNDO
+
+Not useful. This provides only 2 components for genes and samples. What would I do with this? Use as wieghts in linear models, like limma? 
+
+Then none of the output has column names. The use of S for pure doesn't make it clear which one it is, stroma or tumor? Also, the numeric mixing proportions are not that clear!
+
+
+Note that the input expression data should be *after normalization*, but without
+logarithmic transformation. Users can select the normalization method they
+prefer to normalize the raw data.
+
+```{r message=FALSE}
+# source("https://bioconductor.org/biocLite.R")
+# biocLite("UNDO")
+
+library(UNDO)
+```
+
+```{r}
+data(NumericalMixMCF7HS27)
+data(NumericalMixingMatrix)
+data(PureMCF7HS27)
+```
+
+```{r}
+X <- NumericalMixMCF7HS27
+
+head(X)
+options(scipen = 999)
+head(exprs(X))
+# dim(exprs(X)) #22215     2
+```
+
+```{r}
+A <- NumericalMixingMatrix
+head(A)
+```
+
+```{r}
+S <- exprs(PureMCF7HS27)
+head(S)
+# dim(S) #22215     2
+```
+
+```{r}
+two_source_deconv(X,lowper=0.4,highper=0.1,epsilon1=0.01,
+                  epsilon2=0.01,A,S[,1],S[,2],return=0)
+```
+
+```{r}
+result <- two_source_deconv(X,lowper=0.4,highper=0.1,epsilon1=0.01,
+                            epsilon2=0.01,A,S[,1],S[,2],return=1)
+```
+
+
+```{r}
+Sest <- result[[5]]
+head(Sest)
+```
+
+
+```{r fig.height=5, fig.width=10}
+par(mfrow=c(1,2))
+plot(S[,1],Sest[,1],main="MCF7" ,xlab="Estimated expression",
+      ylab="Measured expression", xlim=c(0,15000), ylim=c(0,15000),
+      pch=1, col="turquoise", cex=0.5)
+plot(S[,2],Sest[,2],main="HS27" ,xlab="Estimated expression",
+     ylab="Measured expression", xlim=c(0,15000), ylim=c(0,15000),
+     pch=1, col="turquoise", cex=0.5)
+```
+
+
+```{r}
+aml.TPM <- as.matrix(TPMs[,grep("^PA", colnames(TPMs))])
+nbm.TPM <- as.matrix(TPMs[,grep("^BM|^RO", colnames(TPMs))])
+
+AML.res_a <- two_source_deconv(ExpressionData = aml.TPM, 
+                  S1 = nbm.TPM, 
+                  return=0)
+
+lapply(AML.res_a, head)
+```
+
+
+```{r}
+AML.res_b <- two_source_deconv(ExpressionData = as.matrix(TPMs[,grep("^PA", colnames(TPMs))]), 
+                  S1 = as.matrix(TPMs[,grep("^BM|^RO", colnames(TPMs))]), 
+                  return=1)
+
+```
+
+
+```{r}
+str(AML.res)
+```
+
+
+```{r}
+head(AML.res$Estimated_Mixing_Matrix) #samples are rows? columns correspond to tumor/normals? which one is which? 
+```
+
+There are negative mixing proportions??? Is not logical. Also, potentially need only expressed genes so will need to filter. But overall, this method is not the best. 
+
+```{r}
+AML.res$E1
+```
+
+```{r}
+AML.res$S1_correlation
+AML.res$S2_correlation
+```
+
+```{r}
+head(AML.res[[5]]) #estimated counts, only two dimensions.... 
+```
+
+
+
+
+#CIBERSORT
+
+https://cibersort.stanford.edu/tutorial.php
+
+```{r}
+example <- read.delim("~/RNA_seq_Analysis/0000.00.02_Reference_GeneInfo/ExampleMixtures-GEPs.txt", 
+                      sep="\t")
+
+head(example)
+```
+
+
+CIBERSORT will (by default) normalize the input by quantile normalization. This can be disabled in the configuration of a CIBERSORT job. --- try using TPMs
+
+```{r}
+TPMs.Cibersort <- TPMs %>% 
+  rownames_to_column("GeneSymbol") %>% 
+  select(GeneSymbol, grep("^PA", colnames(.)))
+
+head(TPMs.Cibersort)
+# write.table(TPMs.Cibersort,"TARGET_AML_1031_TPMs_forCIBERSORT.txt",
+#             sep="\t", quote=FALSE, row.names = FALSE)
+```
+
+
+```{r}
+results.CIBERSORT <- read.csv("TARGET_AML_1031_TPMs_CIBERSORT.Output_Job1.csv", stringsAsFactors = FALSE)
+
+head(results.CIBERSORT)
+dim(results.CIBERSORT)
+```
+
+
+```{r}
+results.CIBERSORT <- results.CIBERSORT %>% 
+  inner_join(., select(merged,USI, CBFA2T3.GLIS2),by=c("Input.Sample"="USI"))
+
+
+dim(results.CIBERSORT)
+```
+
+
+```{r}
+CIBER.plot.df <- results.CIBERSORT %>% 
+  gather(Cell_Type,Value, B.cells.naive:Neutrophils)
+
+
+head(CIBER.plot.df)
+```
+
+
+```{r}
+ggplot(CIBER.plot.df, aes(x=Cell_Type, y=Value, fill=CBFA2T3.GLIS2)) + 
+  geom_boxplot() + 
+  facet_wrap(~ Cell_Type, scales = "free") +
+  theme_classic()
+```
+
+
+
+
+#Limma Remove Batch Effects
+
+Voom transformed counts only with the groups of interest. 
+
+NOTE: should select a subset of most varied genes for heatmaps. 
+
+
+```{r}
+test <- blasts.anno %>%
+  filter(Group == "AML") %>% #remove NBMs 
+  mutate(CBFA2T3.GLIS2 = case_when(
+    Rough.Molecular.Classification == "CBFA2T3.GLIS2" ~ "Yes",
+    Rough.Molecular.Classification != "CBFA2T3.GLIS2" ~ "No",
+    TRUE ~ "Other")) %>% 
+  filter(!is.na(Blast..)) #removing those with NA for blasts for testing purposes. We have 7 NAs.  The function fails if NAs present
+
+table(test$CBFA2T3.GLIS2) #there are 25 total GLIS2 positives in the dataset, 23 in 1031 and 2 from 0531/03P1
+```
+
+So likely this would work if you used blasts as a continous covariate and imputed zero for the normal bone marrows when doing that comparison. 
+
+```{r}
+m1 <- model.matrix(~ 0 + CBFA2T3.GLIS2, data = test)
+# apply(m1,2,table)
+# head(m1)
+```
+
+```{r}
+m2 <- model.matrix(~ 0 + CBFA2T3.GLIS2 + Blast.., 
+                   data = test)
+
+# head(m2)
+```
+
+```{r}
+m3 <- model.matrix(~ 0 + CBFA2T3.GLIS2 + Blast.. + Seq.Plate, 
+                   data = test)
+
+# head(m3)
+```
+
+
+```{r message=FALSE}
+library(limma)
+
+cts.test <- cts[,intersect(test$USI, colnames(cts))]
+dge <- DGEList(counts = cts.test)
+
+  
+AML <- ! grepl("^BM|^RO", colnames(cts.test))
+AMLsamples <- ncol(cts.test[,AML])
+
+#5% of AML samples has cpm of at least 1 for a gene
+keep.dge <- rowSums(cpm(dge)[,AML] >= 1) > (0.05*AMLsamples) 
+
+dge <- dge[keep.dge,] #subset for those genes with cmp >= 1 per gene in AML samples
+dge <- calcNormFactors(dge) #Do TMM normalization
+
+dim(dge) #19736 by 1042 
+```
+
+
+```{r}
+v <- voom(dge, m1,plot=TRUE) #what is the model matrix doing in this function? 
+
+# cpm <- cpm(dge, log = TRUE, prior.count = 1)
+```
+
+```{r}
+#could add the design here, but it was already used by voom??
+blasts.asCov.voom <- removeBatchEffect(v, batch = test$Seq.Plate, covariates = test$Blast..) #throws error with NAs in AMLs
+
+str(blasts.asCov.voom)
+```
+
+
+```{r}
+blasts.asCov.voom_Design <- removeBatchEffect(v, batch = test$Seq.Plate, covariates = test$Blast.., 
+                                       design = m1)
+
+str(blasts.asCov.voom_Design)
+```
+
+NOTE: This is difficult because the blast % cannot be NA or it throws an error, thus cannot work without some form of imputation (eg 0s for NBMs) and possilbly removing AML samples w/o this info.. 
+
+```{r fig.height=5, fig.width=20}
+# boxplot(as.data.frame(cpm[,1:500]), main="Original")
+# boxplot(as.data.frame(cpm[,501:1043]), main="Original")
+```
+
+```{r fig.height=5, fig.width=20}
+boxplot(as.data.frame(v$E[,1:500]), main="Original")
+boxplot(as.data.frame(v$E[,501:1042]), main="Original")
+```
+
+```{r fig.height=5, fig.width=20}
+boxplot(as.data.frame(blasts.asCov.voom[,1:500]), main="Batch Corrected")
+boxplot(as.data.frame(blasts.asCov.voom[,501:1042]), main="Batch Corrected")
+```
+
+```{r}
+annoCol <- test %>%
+  select(Sample.ID,Blast.., Rough.Molecular.Classification, Seq.Plate) %>%
+  data.frame() %>%
+  set_rownames(.$Sample.ID)
+
+set.seed(1)
+ann_colors <- list(Rough.Molecular.Classification=cc, 
+                   Seq.Plate=sample(colors, size=15) %>% set_names(unique(annoCol$Seq.Plate)))
+
+head(annoCol)
+```
+
+```{r}
+#top 150 most varied genes. 
+rv <- rowVars(v$E)
+idx <- order(-rv)[1:150]
+# rownames(v$E)[idx]
+```
+
+```{r }
+# tiff("TARGET_AML_1031_Voom_CPM_noCorrection.tiff", height=10, width=10,units="in", res=300)
+pheatmap::pheatmap(v$E[idx,],
+                   border_color=NA,
+                   scale="row",
+                   show_rownames=FALSE,
+                   show_colnames  = FALSE,
+                   annotation_col=annoCol[,-1], 
+                   annotation_colors = ann_colors)
+# dev.off()
+```
+
+```{r}
+# tiff("TARGET_AML_1031_Voom_CPM_asCov.tiff", height=10, width=10,units="in", res=300)
+pheatmap::pheatmap(blasts.asCov.voom[idx,],
+                   border_color=NA,
+                   scale="none",
+                   show_rownames=FALSE,
+                   show_colnames  = FALSE,
+                   annotation_col=annoCol[,-1], 
+                   annotation_colors = ann_colors)
+# dev.off()
+```
+
+```{r}
+# tiff("TARGET_AML_1031_Voom_CPM_asCov_Design.tiff", height=10, width=10,units="in", res=300)
+pheatmap::pheatmap(blasts.asCov.voom_Design[idx,],
+                   border_color=NA,
+                   scale="none",
+                   show_rownames=FALSE,
+                   show_colnames  = FALSE,
+                   annotation_col=annoCol[,-1], 
+                   annotation_colors = ann_colors)
+# dev.off()
+```
+
+
+Ultimately this did not improve the cohort separation by adding in the blast information, after examining the color bars for the top 150 most variaed genes dendrograms.  
+
+
+#Add a term to the model with Limma
+
+```{r}
+ tt <- function(fit){
+   topTable(fit,adjust.method="BH",sort.by="P",
+                 number=20000,p.value=0.05, lfc=1)
+}
+```
+
+```{r}
+compareModelMats <- function(dge,des.mat){
+  v <-  voom(dge, des.mat, plot = FALSE)
+  fitA <- lmFit(v, des.mat)
+  
+  cf <- makeContrasts(contrasts=c("CBFA2T3.GLIS2Yes-CBFA2T3.GLIS2No"), levels=des.mat)
+
+  fitB <- contrasts.fit(fitA, contrasts = cf)
+  fitB <- eBayes(fitB)
+
+  DE <- tt(fitB) %>%
+    rownames_to_column("Gene") %>%
+    arrange(desc(logFC))
+
+  return(list("fit1"=fitA, "fit2"=fitB, "DE"=DE))
+}
+```
+
+
+The idea here is that the lmFit() funtion will fit a model with all the variables from the model.matrix, and it will be additive (therefore "controlling for" the other variables). 
+
+The contrasts.fit() examines the coefs for only the contrast of interest, here GLIS vs NotGLIS. 
+
+```{r}
+matrices <- list(m1,m2, m3)
+
+DE_withBlasts <- lapply(matrices, compareModelMats, dge=dge)
+```
+
+
+
+This method increases the # of DEGs identified, but also moderates the p-values so that we dont get p=0 anylonger. Also, the changes in logFC are basically infinitesimally small. 
+
+
+Question: but adding more terms to the model is by definition going to lead to overfitting. Such that is may still be unadvisable to do this. 
+
+
+
+
+
+
+
+#Session Information 
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+
+
